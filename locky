@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# locky — build-on-demand launcher + caffeinate lifecycle around the overlay.
+#
+# No `set -u`: we source the user's caffeinate.sh, whose `caffeinate on` path
+# reads an optional "$1" duration that is unbound when none is given.
+set -eo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$DIR/locky.m"
+BIN="$DIR/.build/locky"
+
+# ---- build (only when the source is newer than the cached binary) ----------
+mkdir -p "$DIR/.build"
+if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
+  echo "🔨 building locky…"
+  clang -fobjc-arc -O2 -framework Cocoa -framework QuartzCore -o "$BIN" "$SRC"
+fi
+
+# --help shouldn't spin up caffeinate.
+for arg in "$@"; do
+  if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then exec "$BIN" "$@"; fi
+done
+
+# ---- caffeinate on ---------------------------------------------------------
+# Ships with the repo, so this is the normal path rather than a fallback. It
+# keeps its pidfile in $TMPDIR, which means we share state with any other copy
+# of the same script (e.g. one you already source from ~/.zshrc) and never
+# double-caffeinate. If a session was already running before us, we leave it
+# alone on exit. The /usr/bin/caffeinate branch below only matters if someone
+# deletes caffeinate.sh from the checkout.
+CAFF_SH="$DIR/caffeinate.sh"
+OWNS_CAFFEINATE=0
+FALLBACK_PID=""
+
+if [[ -f "$CAFF_SH" ]]; then
+  # shellcheck disable=SC1090
+  source "$CAFF_SH"
+  if _caffeinate_is_running; then
+    echo "☕ caffeinate already active — leaving it running after locky exits"
+  else
+    caffeinate on >/dev/null
+    OWNS_CAFFEINATE=1
+    echo "☕ caffeinate on"
+  fi
+else
+  /usr/bin/caffeinate -dims &
+  FALLBACK_PID=$!
+  echo "☕ caffeinate on (pid $FALLBACK_PID)"
+fi
+
+# ---- caffeinate off, once the overlay is gone -------------------------------
+# A watcher rather than an EXIT trap, because we hand our PID to the overlay
+# with `exec` below and this shell stops existing. `$$` keeps the shell's PID
+# inside a subshell, and exec preserves it, so this waits on the overlay itself.
+# It also covers us if we die before ever reaching the exec.
+SELF=$$
+if [[ "$OWNS_CAFFEINATE" == "1" || -n "$FALLBACK_PID" ]]; then
+  (
+    while kill -0 "$SELF" 2>/dev/null; do sleep 2; done
+    if [[ "$OWNS_CAFFEINATE" == "1" ]]; then
+      caffeinate off >/dev/null 2>&1
+    else
+      kill "$FALLBACK_PID" 2>/dev/null
+    fi
+  ) &
+fi
+
+echo "🔒 locky active — type your password to dismiss"
+
+# exec, not a child process: macOS grants the right to become the frontmost app
+# to the process it launched, and a child doesn't inherit it. Launched from
+# Spotlight as a child, the overlay drew fine but never took the keyboard —
+# everything you typed went to whatever was frontmost before. Same PID, same
+# rights. It also means signals aimed at "locky" reach the overlay directly.
+exec "$BIN" "$@"
