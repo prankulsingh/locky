@@ -15,6 +15,7 @@
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>   // CAMediaTimingFunction for the fades
+#import <CoreAudio/CoreAudio.h>     // muting, without asking anyone's permission
 #include <signal.h>
 
 // A floor of black under every overlay, even when the banner has faded out.
@@ -32,6 +33,27 @@ static const CGFloat kFadeInSeconds  = 0.12;
 static const CGFloat kMoveThreshold = 6.0;
 
 static const CGFloat kCornerAlpha = 0.75;
+
+// Long enough to read as a deliberate change of state rather than a glitch,
+// short enough that it still feels like a reaction to what you just did.
+static const CGFloat kLockdownFadeSeconds = 0.2;
+
+// Lockdown. 120s is already far longer than anyone will stand in front of a
+// screen that is doing nothing, and a repeat offender is no longer somebody who
+// pressed a key by accident, so the second one costs a great deal more.
+static const NSTimeInterval kLockdownFirst  = 120.0;
+static const NSTimeInterval kLockdownRepeat = 300.0;
+
+// Deliberately not hair-trigger. One stray ⌘ from the owner walking past should
+// not black the screen for two minutes; three probes inside ten seconds is
+// somebody trying things. The score decays to nothing after the window.
+static const int           kThreatThreshold = 3;
+static const NSTimeInterval kThreatWindow   = 10.0;
+
+// Clicking is only suspicious in a burst — one click is a person sitting down,
+// several in quick succession is someone hunting for something underneath.
+static const int           kClickBurst      = 3;
+static const NSTimeInterval kClickWindow    = 2.0;
 
 #pragma mark - window
 
@@ -58,6 +80,7 @@ static const CGFloat kCornerAlpha = 0.75;
 @property (nonatomic) BOOL banner;          // pin the banner up, never idle
 @property (nonatomic) BOOL logging;         // forensics log (on by default)
 @property (nonatomic, copy) NSString *escapeKey;  // ⌘<key> quits; nil (default) = none
+@property (nonatomic) BOOL muting;           // silence the speakers (on by default)
 @property (nonatomic) NSTimeInterval idleDelay;
 @end
 
@@ -70,6 +93,26 @@ static const CGFloat kCornerAlpha = 0.75;
     NSMutableArray<NSTextField *> *_corners;
     NSTimer *_clockTimer;
     NSTimer *_idleTimer;
+    NSTimer *_focusTimer;
+    NSString *_stolenBy;     // who last took focus, so we log once per intrusion
+    NSTimer *_lockdownTimer;
+
+    // Kept so lockdown can rewrite the banner in place; the stack itself is
+    // already in _panels, but the text has to change, not just the opacity.
+    NSMutableArray<NSTextField *> *_icons;
+    NSMutableArray<NSTextField *> *_titles;
+    NSMutableArray<NSTextField *> *_subs;
+
+    int _threatScore;
+    NSTimeInterval _lastThreat;
+    int _clickCount;
+    NSTimeInterval _firstClick;
+    int _lockdownCount;       // how many times this session; the 2nd is pricier
+    BOOL _inLockdown;
+
+    AudioObjectID _audioDev;
+    UInt32 _origMute;
+    BOOL _muted;              // we changed it and owe a restore
     NSDateFormatter *_clockFormat;
     NSArray<NSString *> *_screenFrames;
     NSTimeInterval _lastActivity;
@@ -79,6 +122,79 @@ static const CGFloat kCornerAlpha = 0.75;
     FILE *_log;
     NSDateFormatter *_logFormat;
     NSMutableArray *_signalSources;
+}
+
+#pragma mark - volume
+
+// Muting goes through CoreAudio rather than shelling out to osascript: no
+// subprocess, no permission prompt, and we get the exact prior value back to
+// restore instead of a rounded-off percentage.
+//
+// Note what is deliberately absent: any attempt to hold the mute against the
+// user. This silences the speakers so a prank can't be heard, and puts them
+// back exactly as they were.
+
+static AudioObjectID DefaultOutputDevice(void) {
+    AudioObjectID dev = kAudioObjectUnknown;
+    UInt32 size = sizeof(dev);
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyDefaultOutputDevice,
+                                        kAudioObjectPropertyScopeGlobal,
+                                        kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+                                   0, NULL, &size, &dev) != noErr)
+        return kAudioObjectUnknown;
+    return dev;
+}
+
+static AudioObjectPropertyAddress MuteAddr(void) {
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyMute,
+                                     kAudioObjectPropertyScopeOutput,
+                                     kAudioObjectPropertyElementMain };
+    return a;
+}
+
+// A breadcrumb for the wrapper's watcher process. SIGKILL is the one exit we
+// cannot handle, and it would leave the speakers off with nothing to explain
+// why. The watcher reads this file after we die, puts the sound back, and
+// deletes it. Written next to the caffeinate pidfile, for the same reason.
+static NSString *AudioCrumbPath(void) {
+    NSString *tmp = NSTemporaryDirectory() ?: @"/tmp";
+    return [tmp stringByAppendingPathComponent:@"locky.audio"];
+}
+
+// Returns NO when the device simply has no settable mute — some USB and
+// Bluetooth outputs don't — which is a reason to carry on quietly, not to fail.
+- (BOOL)silence {
+    if (_muted) return YES;
+    _audioDev = DefaultOutputDevice();
+    if (_audioDev == kAudioObjectUnknown) return NO;
+    AudioObjectPropertyAddress addr = MuteAddr();
+    if (!AudioObjectHasProperty(_audioDev, &addr)) return NO;
+    Boolean settable = false;
+    if (AudioObjectIsPropertySettable(_audioDev, &addr, &settable) != noErr || !settable)
+        return NO;
+    UInt32 size = sizeof(_origMute);
+    if (AudioObjectGetPropertyData(_audioDev, &addr, 0, NULL, &size, &_origMute) != noErr)
+        return NO;
+    UInt32 on = 1;
+    if (AudioObjectSetPropertyData(_audioDev, &addr, 0, NULL, sizeof(on), &on) != noErr)
+        return NO;
+    _muted = YES;
+    [[NSString stringWithFormat:@"%u\n", _origMute]
+        writeToFile:AudioCrumbPath() atomically:YES
+           encoding:NSUTF8StringEncoding error:NULL];
+    [self note:@"AUDIO muted (was %@)", _origMute ? @"muted" : @"unmuted"];
+    return YES;
+}
+
+- (void)restoreAudio {
+    if (!_muted) return;
+    AudioObjectPropertyAddress addr = MuteAddr();
+    AudioObjectSetPropertyData(_audioDev, &addr, 0, NULL,
+                               sizeof(_origMute), &_origMute);
+    _muted = NO;
+    [NSFileManager.defaultManager removeItemAtPath:AudioCrumbPath() error:NULL];
+    [self note:@"AUDIO restored"];
 }
 
 #pragma mark - forensics
@@ -186,15 +302,24 @@ static NSString *KeyLabel(NSEvent *e) {
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     [self openLog];
     [self watchSignals];
-    [self note:@"---- up  pid %d  strict=%d  banner=%d  hatch=%@ ----",
+    [self note:@"---- up  pid %d  strict=%d  banner=%d  hatch=%@  mute=%d ----",
                getpid(), self.strict, self.banner,
-               self.escapeKey ? @"on" : @"off"];
+               self.escapeKey ? @"on" : @"off", self.muting];
+
+    // Muted up front rather than on first threat: the point is that a prank
+    // makes no noise, and by the time we have detected anything it has already
+    // played. --nomute opts out of this, but not out of the lockdown mute.
+    if (self.muting && ![self silence])
+        [self note:@"AUDIO no settable mute on the default output"];
 
     _windows   = [NSMutableArray array];
     _clocks    = [NSMutableArray array];
     _fields    = [NSMutableArray array];
     _backdrops = [NSMutableArray array];
     _panels    = [NSMutableArray array];
+    _icons     = [NSMutableArray array];
+    _titles    = [NSMutableArray array];
+    _subs      = [NSMutableArray array];
     _corners   = [NSMutableArray array];
 
     _clockFormat = [[NSDateFormatter alloc] init];
@@ -217,6 +342,14 @@ static NSString *KeyLabel(NSEvent *e) {
     _clockTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                   repeats:YES
                                                     block:^(NSTimer *t) { [self tickClock]; }];
+
+    // Deliberately unconditional: this is the safety net, so it runs even when
+    // --banner or a missing idle timer means nothing else is ticking. Half a
+    // second bounds how long anyone can type into whatever they surfaced, and
+    // costs one cheap frontmost-app lookup per tick.
+    _focusTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                  repeats:YES
+                                                    block:^(NSTimer *t) { [self checkFocus]; }];
     [self tickClock];
 
     [NSNotificationCenter.defaultCenter addObserver:self
@@ -237,6 +370,7 @@ static NSString *KeyLabel(NSEvent *e) {
         [self_ noteActivity];
         NSString *label = KeyLabel(e);
         if (label) [self_ note:@"key   %@ %@", ModifierString(e.modifierFlags), label];
+        if ([self_ keyIsShady:e]) [self_ noteThreat:label ?: @"key"];
         if (e.keyCode == 53) return nil;  // swallow Esc
         if (e.modifierFlags & NSEventModifierFlagCommand) {
             NSString *key = e.charactersIgnoringModifiers.lowercaseString;
@@ -265,12 +399,26 @@ static NSString *KeyLabel(NSEvent *e) {
                            NSEventMaskFlagsChanged;
     [NSEvent addLocalMonitorForEventsMatchingMask:activity
                                           handler:^NSEvent *(NSEvent *e) {
-        [weakSelf noteActivity];
+        typeof(self) self_ = weakSelf;
+        if (!self_) return e;
+        [self_ noteActivity];
         // Modifier presses matter even with no key after them: a held ^ or @
         // followed by silence and then another app going active means the
         // shortcut was eaten above us, by the window server.
         if (e.type == NSEventTypeFlagsChanged) {
-            [weakSelf note:@"mod   %@", ModifierString(e.modifierFlags)];
+            [self_ note:@"mod   %@", ModifierString(e.modifierFlags)];
+            // Only on the way down — the flags go to zero on release, and
+            // counting that too would score every probe twice. Shift is absent
+            // from this mask on purpose; see -keyIsShady:.
+            NSEventModifierFlags shady = NSEventModifierFlagCommand |
+                                         NSEventModifierFlagControl |
+                                         NSEventModifierFlagOption  |
+                                         NSEventModifierFlagFunction;
+            if (e.modifierFlags & shady) [self_ noteThreat:@"modifier"];
+        } else if (e.type == NSEventTypeLeftMouseDown ||
+                   e.type == NSEventTypeRightMouseDown ||
+                   e.type == NSEventTypeOtherMouseDown) {
+            [self_ noteClick];
         }
         return e;
     }];
@@ -343,7 +491,7 @@ static NSString *KeyLabel(NSEvent *e) {
 - (void)otherAppActivated:(NSNotification *)note {
     if (_quitting) return;
     NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
-    if ([app isEqual:NSRunningApplication.currentApplication]) return;
+    if (app.processIdentifier == getpid()) return;   // identity by pid; see checkFocus
     // Logged before the grabFocus check: knowing *what* took the screen is the
     // single most useful line in the log, whether or not we snatch it back.
     [self note:@"FOCUS lost to %@ (%@)", app.localizedName, app.bundleIdentifier];
@@ -361,6 +509,9 @@ static NSString *KeyLabel(NSEvent *e) {
     [_fields removeAllObjects];
     [_backdrops removeAllObjects];
     [_panels removeAllObjects];
+    [_icons removeAllObjects];
+    [_titles removeAllObjects];
+    [_subs removeAllObjects];
     [_corners removeAllObjects];
 
     NSScreen *main = NSScreen.mainScreen;
@@ -421,8 +572,11 @@ static NSString *KeyLabel(NSEvent *e) {
 
     NSView *backdrop = [[NSView alloc] initWithFrame:content.bounds];
     backdrop.wantsLayer = YES;
+    // Full black in lockdown, so a display plugged in mid-lockdown comes up
+    // just as dark as the others rather than a helpful window onto the desktop.
     backdrop.layer.backgroundColor =
-        [NSColor.blackColor colorWithAlphaComponent:self.alpha].CGColor;
+        [NSColor.blackColor colorWithAlphaComponent:
+            _inLockdown ? 1.0 : self.alpha].CGColor;
     backdrop.translatesAutoresizingMaskIntoConstraints = NO;
     backdrop.alphaValue = _awake ? 1.0 : 0.0;
     [content addSubview:backdrop];
@@ -448,16 +602,22 @@ static NSString *KeyLabel(NSEvent *e) {
     ]];
     [_panels addObject:stack];
 
-    [stack addArrangedSubview:[self label:@"🔒"
-                                     font:[NSFont systemFontOfSize:64]
-                                    alpha:0.95]];
-    [stack addArrangedSubview:[self label:self.title
-                                     font:[NSFont systemFontOfSize:40 weight:NSFontWeightSemibold]
-                                    alpha:0.95]];
+    NSTextField *icon = [self label:_inLockdown ? @"🚨" : @"🔒"
+                                font:[NSFont systemFontOfSize:64]
+                               alpha:0.95];
+    [stack addArrangedSubview:icon];
+    [_icons addObject:icon];
+
+    NSTextField *head = [self label:_inLockdown ? @"Threat Detected" : self.title
+                                font:[NSFont systemFontOfSize:40 weight:NSFontWeightSemibold]
+                               alpha:0.95];
+    [stack addArrangedSubview:head];
+    [_titles addObject:head];
     // The subtitle is the line that actually does the work — it's the hero,
     // deliberately larger than "Locked". Wraps so a long --subtitle can't run
     // off the edge of the screen.
-    NSTextField *sub = [self label:self.subtitle
+    NSTextField *sub = [self label:_inLockdown ? @"Initiating Lockdown Mode"
+                                              : self.subtitle
                               font:[NSFont systemFontOfSize:44 weight:NSFontWeightSemibold]
                              alpha:0.92];
     sub.lineBreakMode = NSLineBreakByWordWrapping;
@@ -465,6 +625,7 @@ static NSString *KeyLabel(NSEvent *e) {
     sub.preferredMaxLayoutWidth = screen.frame.size.width * 0.8;
     [sub.widthAnchor constraintLessThanOrEqualToConstant:screen.frame.size.width * 0.8].active = YES;
     [stack addArrangedSubview:sub];
+    [_subs addObject:sub];
 
     NSTextField *clock = [self label:@""
                                 font:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular]
@@ -534,6 +695,117 @@ static NSString *KeyLabel(NSEvent *e) {
     return l;
 }
 
+#pragma mark threat / lockdown
+
+// The honest position first: while locky holds focus, none of these keys can
+// actually *do* anything — they land in a password field that ignores them. So
+// this is not a defence, it is a tell. Somebody typing letters is trying to
+// guess the password; somebody cycling ⌘, ⌃, fn and Esc is hunting for a way
+// out, and that is worth reacting to.
+//
+// Shift is the deliberate exception to "modifiers are suspicious". It is the
+// one modifier you must press to type an ordinary password, so shift with a
+// printable key is just typing — treating it as an attack would black the
+// screen on anyone whose password contains a capital letter.
+- (BOOL)keyIsShady:(NSEvent *)e {
+    if (e.keyCode == 53 || e.keyCode == 48) return YES;      // esc, tab
+    NSEventModifierFlags shady = NSEventModifierFlagCommand  |
+                                 NSEventModifierFlagControl  |
+                                 NSEventModifierFlagOption   |
+                                 NSEventModifierFlagFunction;
+    return (e.modifierFlags & shady) != 0;
+}
+
+// Clicking is only suspicious in a burst. One click is somebody sitting down;
+// several in quick succession is somebody hunting for a control underneath.
+- (void)noteClick {
+    NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
+    if (now - _firstClick > kClickWindow) { _firstClick = now; _clickCount = 0; }
+    if (++_clickCount >= kClickBurst) {
+        _clickCount = 0;
+        [self noteThreat:@"click burst"];
+    }
+}
+
+- (void)noteThreat:(NSString *)why {
+    if (_quitting) return;
+    // Already black and silent: nothing further to escalate to, and re-arming
+    // the timer on every keypress would let someone hold it dark forever.
+    if (_inLockdown) return;
+    NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
+    if (now - _lastThreat > kThreatWindow) _threatScore = 0;   // decayed
+    _lastThreat = now;
+    _threatScore++;
+    [self note:@"THREAT %@ (%d/%d)", why, _threatScore, kThreatThreshold];
+    if (_threatScore >= kThreatThreshold) [self enterLockdown];
+}
+
+// The idle fade animates each view's alphaValue, which is already spoken for —
+// it's what hides the banner. Lockdown changes a different thing: the tint's own
+// opacity, living in the layer's background colour. Layer-backed views suppress
+// implicit animations, so this is an explicit one. The model value is set first
+// and the animation added second, which is the ordering that stops the layer
+// snapping back to where it started when the animation finishes.
+- (void)fadeBackdropsTo:(CGFloat)alpha {
+    CGColorRef to = [NSColor.blackColor colorWithAlphaComponent:alpha].CGColor;
+    for (NSView *v in _backdrops) {
+        CABasicAnimation *fade =
+            [CABasicAnimation animationWithKeyPath:@"backgroundColor"];
+        fade.fromValue = (__bridge id)v.layer.backgroundColor;
+        fade.toValue   = (__bridge id)to;
+        fade.duration  = kLockdownFadeSeconds;
+        fade.timingFunction = [CAMediaTimingFunction functionWithName:
+            kCAMediaTimingFunctionEaseInEaseOut];
+        v.layer.backgroundColor = to;
+        [v.layer addAnimation:fade forKey:@"lockdownFade"];
+    }
+}
+
+- (void)enterLockdown {
+    if (_inLockdown || _quitting) return;
+    _inLockdown = YES;
+    _threatScore = 0;
+    NSTimeInterval secs = (++_lockdownCount > 1) ? kLockdownRepeat : kLockdownFirst;
+    [self note:@"LOCKDOWN start %.0fs (#%d)", secs, _lockdownCount];
+
+    // Silenced regardless of --nomute. Someone is actively probing the machine,
+    // and whatever they were lining up to play is the entire reason this exists.
+    // It stays muted until locky quits rather than coming back with the banner —
+    // giving the sound back after two minutes just invites a second go.
+    [self silence];
+
+    [self setAwake:YES];      // never fade out mid-lockdown
+
+    for (NSTextField *l in _icons)  l.stringValue = @"🚨";
+    for (NSTextField *l in _titles) l.stringValue = @"Threat Detected";
+    for (NSTextField *l in _subs)   l.stringValue = @"Initiating Lockdown Mode";
+    [self fadeBackdropsTo:1.0];
+
+    // No countdown on screen, on purpose: a visible timer tells whoever is
+    // standing there exactly how long they need to wait.
+    _lockdownTimer = [NSTimer scheduledTimerWithTimeInterval:secs
+                                                     repeats:NO
+                                                       block:^(NSTimer *t) {
+        [self exitLockdown];
+    }];
+}
+
+- (void)exitLockdown {
+    if (!_inLockdown || _quitting) return;
+    _inLockdown = NO;
+    [_lockdownTimer invalidate];
+    _lockdownTimer = nil;
+    [self note:@"LOCKDOWN end"];
+
+    for (NSTextField *l in _icons)  l.stringValue = @"🔒";
+    for (NSTextField *l in _titles) l.stringValue = self.title;
+    for (NSTextField *l in _subs)   l.stringValue = self.subtitle;
+    [self fadeBackdropsTo:self.alpha];
+
+    // Audio is deliberately left muted until we quit; see enterLockdown.
+    _lastActivity = NSDate.timeIntervalSinceReferenceDate;
+}
+
 #pragma mark idle / wake
 
 // Any input at all resets the countdown. Cheap enough to call from a monitor
@@ -557,6 +829,7 @@ static NSString *KeyLabel(NSEvent *e) {
 
 - (void)checkIdle {
     if (_quitting || !_awake) return;
+    if (_inLockdown) return;   // the black screen is the point; don't fade it
     if (NSDate.timeIntervalSinceReferenceDate - _lastActivity < self.idleDelay) return;
     [self setAwake:NO];
 }
@@ -638,6 +911,43 @@ static NSString *KeyLabel(NSEvent *e) {
     }
 }
 
+// The two handlers above are edge-triggered: one activation notification, one
+// attempt to take focus back. That is fast, but it is not a guarantee — if an
+// app wins the race and never activates again, or grabs focus in a way we never
+// get told about, nothing retries and we stay in the background for good.
+//
+// This is the level-triggered backstop. It doesn't care how focus was lost; it
+// just asks who is frontmost and takes it back if the answer isn't us. That is
+// the difference between locky usually getting focus back and always getting it
+// back. Launchpad is the reason: it can launch anything, and the launched app
+// activates on its own schedule, long after any notification we already handled.
+- (void)checkFocus {
+    if (_quitting || !self.grabFocus) return;
+    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+    // Identity by pid, which is unambiguous and says exactly what we mean: is
+    // that me? It matters more than it looks — a second locky instance is a
+    // genuinely different app that we *should* fight for focus, and the pid is
+    // what separates that case from mistaking ourselves for the thief.
+    if (!front || front.processIdentifier == getpid()) {
+        _stolenBy = nil;   // we're back on top; the next theft is a fresh one
+        return;
+    }
+    NSString *bid = front.bundleIdentifier ?: front.localizedName ?: @"?";
+    // Never fight the real screen lock or the screen saver. If the Mac has
+    // genuinely locked, that is a far better deterrent than we are, and clawing
+    // focus back from the login window would be both useless and obnoxious.
+    if ([bid isEqualToString:@"com.apple.loginwindow"] ||
+        [bid isEqualToString:@"com.apple.ScreenSaver.Engine"]) return;
+    // One line per intrusion rather than one per tick, or a determined app would
+    // flood the log at 2 Hz and bury the thing you actually want to read.
+    if (![bid isEqualToString:_stolenBy]) {
+        [self note:@"REGRAB from %@ (%@)", front.localizedName, bid];
+        _stolenBy = bid;
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+    [self focusPrimaryField];
+}
+
 - (void)tickClock {
     NSString *now = [_clockFormat stringFromDate:[NSDate date]];
     for (NSTextField *c in _clocks) c.stringValue = now;
@@ -691,6 +1001,7 @@ doCommandBySelector:(SEL)selector {
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note {
+    [self restoreAudio];   // idempotent; dismiss normally got here first
     [self note:@"EXIT  clean shutdown"];
     if (_log) fclose(_log);
     _log = NULL;
@@ -701,6 +1012,9 @@ doCommandBySelector:(SEL)selector {
     _quitting = YES;
     [_clockTimer invalidate];
     [_idleTimer invalidate];
+    [_focusTimer invalidate];
+    [_lockdownTimer invalidate];
+    [self restoreAudio];
     [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     for (OverlayWindow *w in _windows) [w orderOut:nil];
@@ -737,6 +1051,8 @@ static void PrintUsage(void) {
         "                            shutdown dialog (both blocked by default)\n"
         "      --escape-key <c>      add a ⌘<c> escape hatch that quits without\n"
         "                            the password (default: none at all)\n"
+        "      --nomute              leave the system volume alone (locky mutes\n"
+        "                            on start and restores it on exit)\n"
         "      --no-log              don't write ~/Library/Logs/locky.log\n"
         "      --debug               print screen/window geometry on startup\n"
         "  -h, --help                this\n"
@@ -749,6 +1065,12 @@ static void PrintUsage(void) {
         "Dismiss by typing the password (from ~/pass.txt, default 8888). There is\n"
         "no escape hatch unless you add one with --escape-key; Esc and ⌘Q do\n"
         "nothing on purpose. A deterrent, not a lock.\n"
+        "\n"
+        "Poking at it is noticed. Modifier keys, Esc, Tab and bursts of clicking\n"
+        "score as probing; enough of them in a few seconds blacks the screen out\n"
+        "completely for two minutes (five for a repeat) behind a 🚨 banner, and\n"
+        "mutes the speakers even under --nomute. Sound comes back when locky\n"
+        "quits. The password and the escape hatch still work throughout.\n"
         "\n"
         "Modifier keystrokes, focus changes and how locky exited are appended to\n"
         "~/Library/Logs/locky.log, so you can see how somebody got past it. Plain\n"
@@ -766,6 +1088,7 @@ int main(int argc, const char *argv[]) {
         delegate.idleDelay = 5.0;
         delegate.logging = YES;
         delegate.strict = YES;
+        delegate.muting = YES;
 
         for (int i = 1; i < argc; i++) {
             NSString *arg = @(argv[i]);
@@ -813,6 +1136,9 @@ int main(int argc, const char *argv[]) {
                     return 1;
                 }
                 i++;
+            } else if ([arg isEqualToString:@"--nomute"] ||
+                       [arg isEqualToString:@"--no-mute"]) {
+                delegate.muting = NO;
             } else if ([arg isEqualToString:@"--no-log"]) {
                 delegate.logging = NO;
             }

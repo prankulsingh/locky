@@ -27,6 +27,8 @@ run. Any key, click or mouse move brings it straight back.
 - [Spotlight and a keyboard shortcut](#spotlight-and-a-keyboard-shortcut)
 - [Idle mode](#idle-mode)
 - [Keyboard hardening](#keyboard-hardening)
+- [Muting](#muting)
+- [Lockdown mode](#lockdown-mode)
 - [Forensics log](#forensics-log)
 - [Keeping the Mac awake](#keeping-the-mac-awake)
 - [How it works](#how-it-works)
@@ -133,6 +135,7 @@ so the log names your hatch once you've used it.
                           (both are blocked by default)
     --escape-key <c>      add a ⌘<c> escape hatch that quits without the
                           password (default: none at all)
+    --nomute              leave the system volume alone
     --no-log              don't write ~/Library/Logs/locky.log
     --debug               print screen/window geometry and kiosk state
 -h, --help
@@ -328,6 +331,66 @@ want it genuinely shut, cheapest first:
 
 The overlay stays on top of Spotlight regardless, so they'd be typing blind.
 
+## Muting
+
+locky mutes the default output device on the way up and puts it back exactly as
+it found it on the way down. A prank you can't hear is a prank that didn't
+happen, and the speakers are the one thing the overlay can't cover.
+
+```sh
+locky --nomute     # leave the volume alone
+```
+
+It reads the previous mute state, sets mute, and restores that exact value on
+exit — it does not "unmute", so if your Mac was already muted it stays muted
+afterwards. Done through CoreAudio directly, so there is no subprocess and no
+permission prompt. On an output device with no settable mute (some USB and
+Bluetooth outputs), locky notes that in the log and carries on.
+
+**Force quit is covered too.** `SIGKILL` runs none of locky's exit path, which
+would otherwise leave you with a silently muted Mac and no clue why. locky drops
+a crumb file at `$TMPDIR/locky.audio` holding the previous state and deletes it
+on a clean exit; the wrapper's watcher process finds the crumb after an unclean
+death, restores the sound, and prints `🔊 sound restored after an unclean exit`.
+
+---
+
+## Lockdown mode
+
+Typing letters at locky is somebody trying to guess the password. Cycling
+through ⌘, ⌃, ⌥, fn, Esc and Tab is somebody hunting for a way out. locky scores
+the second kind, and if enough of it arrives at once it stops being polite:
+
+- the overlay fades to **full opaque black** over 0.2s — no wallpaper, no
+  windows, nothing
+- the banner becomes **🚨 / Threat Detected / Initiating Lockdown Mode**
+- the speakers are **muted even under `--nomute`**
+- it holds for **120 seconds**, or **300** for any later lockdown in the session
+
+| Counts as probing | Doesn't |
+|---|---|
+| ⌘, ⌃, ⌥ or fn — pressed alone or with anything | letters, digits, punctuation |
+| Esc, Tab | Return, Delete |
+| 3 clicks inside 2 seconds | moving the mouse, a single click |
+
+**Shift is deliberately not on that list.** It's the one modifier you have to
+press to type an ordinary password, and scoring it would black the screen on
+anyone whose password has a capital letter in it.
+
+It takes **3 probes within 10 seconds** to trigger, so one stray ⌘ from you
+walking past won't do it; the score decays to nothing after that window. Both
+numbers, and the two durations, are constants at the top of `locky.m`.
+
+**The password and the escape hatch both still work during lockdown** — it is a
+deterrent, not a trap, and it can't lock you out of your own machine. There is
+no countdown on screen, on purpose: a visible timer tells whoever is standing
+there exactly how long they need to wait.
+
+Sound stays muted after the black screen lifts, until locky quits. Handing the
+speakers back after two minutes just invites a second attempt.
+
+---
+
 ## Forensics log
 
 locky appends to `~/Library/Logs/locky.log`: modifier keystrokes, which app took
@@ -354,10 +417,18 @@ eaten above locky. Read it as:
 | `EXIT escape hatch` / `EXIT password` | the `--escape-key` hatch, or the password |
 | `EXIT signal 15` | someone ran `kill` |
 | `FOCUS lost to Terminal` | went out through Spotlight |
+| `THREAT modifier (2/3)` | a probe was scored; 3 in 10s triggers lockdown |
+| `LOCKDOWN start 120s (#1)` | the screen went black; `#2` and later last 300s |
+| `AUDIO muted` / `AUDIO restored` | the speakers, on the way in and out |
 | modifiers, no key, then **nothing at all** | `SIGKILL` — force quit |
 
 That last row is not a gap in the log: `SIGKILL` cannot be caught by any
-process, so the silence *is* the signature. The log is line-buffered precisely
+process, so the silence *is* the signature.
+
+`FOCUS lost to …` is normally followed by `REGRAB from …`, which is locky taking
+the screen back. There is one `REGRAB` per intrusion rather than one per attempt,
+so a persistent app can't flood the log. **A `FOCUS lost` with no matching
+`REGRAB` is the line to care about** — something took the screen and kept it. The log is line-buffered precisely
 so the lines before a kill survive it.
 
 One caveat worth knowing: because every ⌘-combination is logged, **using an
@@ -412,7 +483,8 @@ Three files matter:
 The build is one command, which the wrapper runs for you:
 
 ```sh
-clang -fobjc-arc -O2 -framework Cocoa -framework QuartzCore -o .build/locky locky.m
+clang -fobjc-arc -O2 -framework Cocoa -framework QuartzCore \
+      -framework CoreAudio -o .build/locky locky.m
 ```
 
 At runtime locky creates one borderless `NSWindow` per screen at
@@ -515,8 +587,14 @@ The non-obvious decisions, and the traps behind them:
   trap, which also fixed a pre-existing bug where killing the wrapper left the
   overlay running.
 
-- **Focus is re-taken ~0.4s after you switch apps**, so typing the password
-  always lands somewhere useful. `--no-focus-grab` turns that off.
+- **Focus is taken back on a 0.5s heartbeat**, not only when macOS reports that
+  the active app changed. Those notifications are edge-triggered — one event,
+  one attempt — so losing the race once used to mean staying in the background
+  indefinitely. A timer that just asks *am I frontmost?* makes recovery
+  unconditional and retried forever, which matters because macOS can refuse an
+  activation request outright. Measured worst case with the fast path disabled:
+  437ms. It stands down for the login window and screen saver, on the grounds
+  that a real lock beats locky. `--no-focus-grab` turns the whole thing off.
 
 - **One window per screen**, sized to that screen's exact frame; plugging or
   unplugging a display rebuilds them automatically. `--debug` prints the geometry

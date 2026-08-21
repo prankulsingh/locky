@@ -13,7 +13,8 @@ BIN="$DIR/.build/locky"
 mkdir -p "$DIR/.build"
 if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
   echo "🔨 building locky…"
-  clang -fobjc-arc -O2 -framework Cocoa -framework QuartzCore -o "$BIN" "$SRC"
+  clang -fobjc-arc -O2 -framework Cocoa -framework QuartzCore \
+        -framework CoreAudio -o "$BIN" "$SRC"
 fi
 
 # --help shouldn't spin up caffeinate.
@@ -54,16 +55,31 @@ fi
 # inside a subshell, and exec preserves it, so this waits on the overlay itself.
 # It also covers us if we die before ever reaching the exec.
 SELF=$$
-if [[ "$OWNS_CAFFEINATE" == "1" || -n "$FALLBACK_PID" ]]; then
-  (
-    while kill -0 "$SELF" 2>/dev/null; do sleep 2; done
-    if [[ "$OWNS_CAFFEINATE" == "1" ]]; then
-      caffeinate off >/dev/null 2>&1
+# Now unconditional, where it used to start only if we owned a caffeinate
+# session: it also has to put the speakers back. locky mutes on the way up and
+# unmutes on the way down, but SIGKILL — a force quit — runs none of its exit
+# path, and a Mac left silently muted with no explanation is a genuinely nasty
+# thing to leave behind. locky writes the previous mute state to a crumb file
+# and deletes it on a clean exit, so a crumb still present here means it died
+# badly and the sound is ours to restore.
+AUDIO_CRUMB="${TMPDIR:-/tmp}/locky.audio"
+(
+  while kill -0 "$SELF" 2>/dev/null; do sleep 2; done
+  if [[ "$OWNS_CAFFEINATE" == "1" ]]; then
+    caffeinate off >/dev/null 2>&1
+  elif [[ -n "$FALLBACK_PID" ]]; then
+    kill "$FALLBACK_PID" 2>/dev/null
+  fi
+  if [[ -f "$AUDIO_CRUMB" ]]; then
+    if [[ "$(cat "$AUDIO_CRUMB" 2>/dev/null)" == "1" ]]; then
+      osascript -e 'set volume with output muted' >/dev/null 2>&1
     else
-      kill "$FALLBACK_PID" 2>/dev/null
+      osascript -e 'set volume without output muted' >/dev/null 2>&1
     fi
-  ) &
-fi
+    rm -f "$AUDIO_CRUMB"
+    echo "🔊 sound restored after an unclean exit" >&2
+  fi
+) &
 
 echo "🔒 locky active — type your password to dismiss"
 
