@@ -44,15 +44,19 @@ static const CGFloat kLockdownFadeSeconds = 0.2;
 static const NSTimeInterval kLockdownFirst  = 120.0;
 static const NSTimeInterval kLockdownRepeat = 300.0;
 
-// Deliberately not hair-trigger. One stray ⌘ from the owner walking past should
-// not black the screen for two minutes; three probes inside ten seconds is
-// somebody trying things. The score decays to nothing after the window.
-static const int           kThreatThreshold = 3;
+// Two probes inside ten seconds, and the score decays to nothing after that.
+// A single stray ⌘ from the owner walking past still costs nothing, but there
+// is no third strike: anyone deliberately trying combinations produces two
+// almost immediately, because a shortcut delivers the modifier and the key as
+// separate events.
+static const int           kThreatThreshold = 2;
 static const NSTimeInterval kThreatWindow   = 10.0;
 
-// Clicking is only suspicious in a burst — one click is a person sitting down,
-// several in quick succession is someone hunting for something underneath.
-static const int           kClickBurst      = 3;
+// One click is a person sitting down; a second one is somebody who saw that
+// the first did nothing and is checking whether anything underneath responds.
+// Two clicks score the same as one modifier press, so four clicks reach a
+// lockdown by the same route two ⌘s do.
+static const int           kClickBurst      = 2;
 static const NSTimeInterval kClickWindow    = 2.0;
 
 #pragma mark - window
@@ -370,17 +374,23 @@ static NSString *KeyLabel(NSEvent *e) {
         [self_ noteActivity];
         NSString *label = KeyLabel(e);
         if (label) [self_ note:@"key   %@ %@", ModifierString(e.modifierFlags), label];
+        // The hatch is checked before anything scores it. A shortcut arrives as
+        // two events — the modifier, then the key — which is two probes, so the
+        // owner's own way out would otherwise black the screen for the instant
+        // before it quits. Also placed before the ⌘Q swallow further down, so
+        // --escape-key q genuinely makes ⌘Q the hatch rather than being eaten.
+        if (self_.escapeKey && (e.modifierFlags & NSEventModifierFlagCommand) &&
+            [e.charactersIgnoringModifiers.lowercaseString
+                isEqualToString:self_.escapeKey]) {
+            [self_ note:@"EXIT  escape hatch"];
+            [self_ dismiss];
+            return nil;
+        }
         if ([self_ keyIsShady:e]) [self_ noteThreat:label ?: @"key"];
+        else                      [self_ noteOrdinaryKey];
         if (e.keyCode == 53) return nil;  // swallow Esc
         if (e.modifierFlags & NSEventModifierFlagCommand) {
             NSString *key = e.charactersIgnoringModifiers.lowercaseString;
-            // Checked before the ⌘Q swallow below, so setting --escape-key q
-            // genuinely makes ⌘Q the hatch rather than being eaten.
-            if (self_.escapeKey && [key isEqualToString:self_.escapeKey]) {
-                [self_ note:@"EXIT  escape hatch"];
-                [self_ dismiss];
-                return nil;
-            }
             // ⌘Q is the combination anyone reaches for first, so it's the one
             // that must go nowhere. We build no menu, so nothing would act on
             // it anyway — swallowing it just makes that explicit and immune to
@@ -716,8 +726,9 @@ static NSString *KeyLabel(NSEvent *e) {
     return (e.modifierFlags & shady) != 0;
 }
 
-// Clicking is only suspicious in a burst. One click is somebody sitting down;
-// several in quick succession is somebody hunting for a control underneath.
+// Note that an ordinary double-click is two clicks, so it scores as a probe on
+// its own. That is the intent: nothing under the shield can be double-clicked,
+// so trying it is already someone testing what the overlay will let through.
 - (void)noteClick {
     NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
     if (now - _firstClick > kClickWindow) { _firstClick = now; _clickCount = 0; }
@@ -725,6 +736,21 @@ static NSString *KeyLabel(NSEvent *e) {
         _clickCount = 0;
         [self noteThreat:@"click burst"];
     }
+}
+
+// A probe followed by ordinary typing is its own tell: somebody tried a
+// shortcut, found that it did nothing, and moved on to guessing the password.
+// Neither half means much alone — plain typing is exactly what the field is
+// for — but the pair inside one window is not somebody who brushed a key.
+- (void)noteOrdinaryKey {
+    if (_quitting || _inLockdown) return;
+    if (_threatScore < 1) return;                      // nothing to pair with
+    if (NSDate.timeIntervalSinceReferenceDate - _lastThreat > kThreatWindow) {
+        _threatScore = 0;                              // the probe already decayed
+        return;
+    }
+    [self note:@"THREAT hotkey then ordinary key"];
+    [self enterLockdown];
 }
 
 - (void)noteThreat:(NSString *)why {
@@ -1067,10 +1093,11 @@ static void PrintUsage(void) {
         "nothing on purpose. A deterrent, not a lock.\n"
         "\n"
         "Poking at it is noticed. Modifier keys, Esc, Tab and bursts of clicking\n"
-        "score as probing; enough of them in a few seconds blacks the screen out\n"
-        "completely for two minutes (five for a repeat) behind a 🚨 banner, and\n"
-        "mutes the speakers even under --nomute. Sound comes back when locky\n"
-        "quits. The password and the escape hatch still work throughout.\n"
+        "score as probing. Two of them within ten seconds — or one followed by\n"
+        "ordinary typing — fades the screen to black for two minutes (five for a\n"
+        "repeat) behind a 🚨 banner, and mutes the speakers even under --nomute.\n"
+        "Sound comes back when locky quits, and the password and escape hatch\n"
+        "both still work throughout.\n"
         "\n"
         "Modifier keystrokes, focus changes and how locky exited are appended to\n"
         "~/Library/Logs/locky.log, so you can see how somebody got past it. Plain\n"

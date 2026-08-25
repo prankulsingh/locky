@@ -367,19 +367,33 @@ the second kind, and if enough of it arrives at once it stops being polite:
 - the speakers are **muted even under `--nomute`**
 - it holds for **120 seconds**, or **300** for any later lockdown in the session
 
-| Counts as probing | Doesn't |
+| Counts as probing | Harmless on its own |
 |---|---|
 | ⌘, ⌃, ⌥ or fn — pressed alone or with anything | letters, digits, punctuation |
 | Esc, Tab | Return, Delete |
-| 3 clicks inside 2 seconds | moving the mouse, a single click |
+| 2 clicks inside 2 seconds — a double-click counts | moving the mouse, one click |
 
 **Shift is deliberately not on that list.** It's the one modifier you have to
 press to type an ordinary password, and scoring it would black the screen on
 anyone whose password has a capital letter in it.
 
-It takes **3 probes within 10 seconds** to trigger, so one stray ⌘ from you
-walking past won't do it; the score decays to nothing after that window. Both
-numbers, and the two durations, are constants at the top of `locky.m`.
+**Two probes within 10 seconds** trigger a lockdown, and the score decays to
+nothing after that window. Note that a real shortcut delivers the modifier and
+the key as two separate events, so a single deliberate `⌘`-anything already
+reaches two — the escape hatch is exempt, checked before anything scores it.
+
+**One probe followed by ordinary typing counts too.** That is why the right-hand
+column says *on its own*: somebody who tried a shortcut, found it did nothing,
+and moved on to guessing the password is not somebody who brushed a key. Plain
+typing with no probe before it stays exactly as harmless as it looks.
+
+**Four clicks reach a lockdown**, by exactly the same route two ⌘s do: two
+clicks score as one probe, and two probes trigger. A double-click is therefore a
+probe on its own — deliberately, since nothing under the shield can be
+double-clicked, so trying it is already testing what the overlay lets through.
+
+The threshold, the window, the click burst and the two durations are all
+constants at the top of `locky.m`.
 
 **The password and the escape hatch both still work during lockdown** — it is a
 deterrent, not a trap, and it can't lock you out of your own machine. There is
