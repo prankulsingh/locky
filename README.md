@@ -41,14 +41,20 @@ run. Any key, click or mouse move brings it straight back.
 
 ## Requirements
 
-- macOS with the **Xcode Command Line Tools** (for `clang`):
+- **macOS.**
+- The **Xcode Command Line Tools** — the only thing you may need to install.
+  They provide both `clang` (to build locky) and `git` (to clone it):
 
   ```sh
   xcode-select --install
   ```
 
-- Nothing else. No Xcode, no Homebrew, no dependencies, no Accessibility or
-  Screen Recording permission, no `sudo`, no code signing.
+  Click **Install** in the dialog that appears and wait for it to finish. Most
+  developer Macs already have them; `install.sh` checks and tells you if they're
+  missing.
+
+- **Nothing else.** No full Xcode, no Homebrew, no dependencies, no
+  Accessibility or Screen Recording permission, no `sudo`, no code signing.
 
 Developed and tested on **macOS 26.3.1, Apple Silicon**. The APIs it uses are
 old and stable, so older macOS versions very likely work — but that is untested,
@@ -56,17 +62,40 @@ so treat it as unverified rather than supported.
 
 ## Install
 
+On a fresh Mac, four lines from clone to a Spotlight-launchable app:
+
 ```sh
-git clone https://github.com/YOURNAME/locky.git
+git clone https://github.com/prankulsingh/locky.git
 cd locky
-./locky
+./install.sh
+echo 'your-password' > ~/pass.txt && chmod 600 ~/pass.txt
 ```
 
-The first run compiles `locky.m` into `.build/locky` (about a second). After
-that the binary is cached and only rebuilt when the source changes. There is no
-separate build step and no Makefile — the `locky` wrapper script handles it.
+That's it. Now type **locky** into Spotlight (⌘Space) and press return, or run
+`./locky` from the checkout.
 
-To call it from anywhere, either symlink it onto your `PATH` or alias it:
+`install.sh` is safe to re-run and does the whole setup:
+
+- checks the one prerequisite (the Command Line Tools) and tells you exactly
+  what to run if they're missing,
+- compiles `locky.m` into `.build/locky` (about a second),
+- creates `Locky.app` in `~/Applications` and registers it so Spotlight,
+  Shortcuts.app and Finder can all launch it,
+- prints how to set a password and add a global hotkey.
+
+It installs no launch agents, writes nothing to `/Library`, needs no `sudo`,
+and changes no system settings. `./install.sh --banner` *also* installs a
+permanent-banner variant; `./install.sh --help` explains the rest.
+
+> **Keep the checkout where it is.** Both the `locky` wrapper and the app bundle
+> record the path of this folder. If you move it, re-run `./install.sh` so they
+> point at the new location.
+
+### Without the app bundle
+
+If you only ever launch from a terminal, you can skip `install.sh` entirely —
+just run `./locky`, which builds on first use. To call it from anywhere, symlink
+or alias it:
 
 ```sh
 ln -s "$PWD/locky" /usr/local/bin/locky
@@ -74,8 +103,8 @@ ln -s "$PWD/locky" /usr/local/bin/locky
 alias locky="$PWD/locky"
 ```
 
-For launching it from Spotlight or a global hotkey, see
-[Spotlight and a keyboard shortcut](#spotlight-and-a-keyboard-shortcut).
+The app bundle only matters for launching from Spotlight or a global hotkey —
+see [Spotlight and a keyboard shortcut](#spotlight-and-a-keyboard-shortcut).
 
 ## Set a password
 
@@ -161,8 +190,24 @@ same `./locky` wrapper.
 
 ### 1. Create the bundle
 
-Run this **from inside your locky checkout**. It is self-contained — copy the
-whole block:
+If you ran [`./install.sh`](#install) during setup, **the bundle already
+exists** — skip to the hotkey below. If you installed only the CLI, run it now:
+
+```sh
+./install.sh
+```
+
+Then type "locky" into Spotlight and press return. The bundle records the repo
+path, so **re-run `./install.sh` if you move the checkout.**
+
+<details>
+<summary>What the bundle is, and how to build it by hand</summary>
+
+A shell script can't be indexed by Spotlight or targeted by Shortcuts.app, so
+`install.sh` creates a thin `.app` whose only job is to be something
+LaunchServices will index. It pins a sane `PATH` and hands straight off to the
+same `./locky` wrapper. If you'd rather create it yourself (or see exactly what
+the installer does), run this from inside your checkout:
 
 ```sh
 REPO="$PWD"
@@ -211,10 +256,7 @@ cp "$REPO/Locky.icns" "$APP/Contents/Resources/Locky.icns"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 ```
 
-Now type "locky" into Spotlight and press return.
-
-The bundle records the repo path at creation time, so **re-run this block if you
-move the checkout.**
+</details>
 
 ### 2. Add a global hotkey
 
@@ -232,16 +274,17 @@ global, so it fires from any app.
 ### Two modes, two hits
 
 If you want both the fading and the permanent-banner mode a Spotlight hit away,
-run the block again with `APP="$HOME/Applications/Locky Banner.app"`, a different
-`BUNDLE_ID`, and `--banner` appended to the `exec` line.
+run `./install.sh --banner`. It adds a second bundle, `Locky Banner.app`, that
+launches with `--banner`, so Spotlight gives you both "Locky" and "Locky
+Banner".
 
 ### The icon
 
 `Locky.icns` is committed to the repo and copied into the bundle. It's the 🔒
 Apple Color Emoji glyph rendered at all ten required icon sizes; macOS draws the
 rounded container around it automatically. To change it, drop a different
-`.icns` in as `Locky.icns` and re-run the block — `CFBundleIconFile` just says
-`Locky`.
+`.icns` in as `Locky.icns` and re-run `./install.sh` — `CFBundleIconFile` just
+says `Locky`.
 
 ## Idle mode
 
@@ -489,6 +532,7 @@ Three files matter:
 |---|---|
 | `locky.m` | the whole application — one Objective-C file, no headers |
 | `locky` | bash wrapper: build-on-demand, caffeinate lifecycle, then `exec`s the binary |
+| `install.sh` | one-command setup: builds, creates `Locky.app`, registers it |
 | `caffeinate.sh` | keep-awake helper, sourced by the wrapper; usable standalone |
 | `Locky.icns` | app icon, copied into the `.app` bundle |
 
@@ -514,7 +558,7 @@ the idle timer, the password field — hangs off that.
 **A Spotlight launch does nothing.** GUI launches have no terminal, so the
 bundle redirects output to `.build/launch.log` in your checkout. Look there
 first. The usual cause is a moved checkout — the bundle hardcodes the repo path,
-so re-run the bundle creation block.
+so re-run `./install.sh`.
 
 **Locky doesn't appear in Spotlight.** Re-register it:
 
@@ -558,6 +602,7 @@ strict mode; `0x12a` is `--no-strict`.
 
 ```sh
 rm -rf ~/Applications/Locky.app
+rm -rf "$HOME/Applications/Locky Banner.app"   # if you ran install.sh --banner
 rm -f ~/Library/Logs/locky.log
 rm -f /usr/local/bin/locky          # if you symlinked it
 rm -rf /path/to/your/locky-checkout
@@ -621,5 +666,6 @@ The non-obvious decisions, and the traps behind them:
 
 ## License
 
-Not yet chosen — add one before publishing. MIT is the conventional fit for
-something this size.
+[MIT](LICENSE) © Prankul Singh. Free to use, modify and redistribute,
+including commercially — the one condition is that you **keep the copyright
+notice** (i.e. credit this project / its author). No warranty.
