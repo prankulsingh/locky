@@ -353,7 +353,16 @@ static NSString *KeyLabel(NSEvent *e) {
     // costs one cheap frontmost-app lookup per tick.
     _focusTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                   repeats:YES
-                                                    block:^(NSTimer *t) { [self checkFocus]; }];
+                                                    block:^(NSTimer *t) {
+        [self checkFocus];
+        // Also reconcile screens here, not only on the parameter-change
+        // notification: a display that was already attached but enumerated a
+        // beat after launch never fires that notification, so it would be
+        // missed for the whole session. This re-check is near-free — it bails
+        // immediately when the frames are unchanged — and self-heals that race
+        // within half a second. (See screensChanged.)
+        [self screensChanged];
+    }];
     [self tickClock];
 
     [NSNotificationCenter.defaultCenter addObserver:self
@@ -915,9 +924,13 @@ static NSString *KeyLabel(NSEvent *e) {
     }
 }
 
-// Fires for more than display changes — hiding the menu bar/dock shifts every
-// screen's visibleFrame and re-fires this. Rebuilding then would wipe whatever
-// password is half-typed, so only rebuild when the frames really moved.
+// Called two ways: from NSApplicationDidChangeScreenParametersNotification, and
+// every 0.5s from the focus timer as a safety net for a display the notification
+// never reported (one already attached at launch but enumerated late). Both
+// fire for more than real display changes — hiding the menu bar/dock shifts
+// every screen's visibleFrame and re-fires the notification — and rebuilding
+// then would wipe a half-typed password, so only rebuild when the frames really
+// moved. The frame-equality guard makes the periodic call cheap and safe.
 - (void)screensChanged {
     NSMutableArray<NSString *> *now = [NSMutableArray array];
     for (NSScreen *s in NSScreen.screens) [now addObject:NSStringFromRect(s.frame)];
