@@ -535,6 +535,7 @@ Three files matter:
 | `install.sh` | one-command setup: builds, creates `Locky.app`, registers it |
 | `caffeinate.sh` | keep-awake helper, sourced by the wrapper; usable standalone |
 | `Locky.icns` | app icon, copied into the `.app` bundle |
+| `AGENTS.md` | install/usage guide for an AI coding agent helping someone set this up |
 
 `.build/` holds the compiled binary and `launch.log`, and is gitignored.
 
