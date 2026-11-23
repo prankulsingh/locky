@@ -337,6 +337,13 @@ static NSString *KeyLabel(NSEvent *e) {
 
     [self buildWindows];
 
+    // occlusionState is stale at build; re-dump once the compositor has settled
+    // so a failing secondary display shows up as visible=1 but occlusionVisible=0.
+    if (self.debug) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self dumpSettledCoverage]; });
+    }
+
     if (!self.banner) {
         _idleTimer = [NSTimer scheduledTimerWithTimeInterval:0.25
                                                      repeats:YES
@@ -362,6 +369,9 @@ static NSString *KeyLabel(NSEvent *e) {
         // immediately when the frames are unchanged — and self-heals that race
         // within half a second. (See screensChanged.)
         [self screensChanged];
+        // And keep every secondary-display window asserted at shield level and
+        // fronted, in case one was occluded or demoted after launch.
+        [self assertCoverage];
     }];
     [self tickClock];
 
@@ -548,14 +558,49 @@ static NSString *KeyLabel(NSEvent *e) {
         for (NSUInteger i = 0; i < screens.count; i++) {
             NSRect s = screens[i].frame;
             NSRect w = _windows[i].frame;
-            printf("  [%lu] screen %.0f,%.0f %.0fx%.0f  window %.0f,%.0f %.0fx%.0f  visible=%d  %s\n",
+            printf("  [%lu] screen %.0f,%.0f %.0fx%.0f  window %.0f,%.0f %.0fx%.0f  visible=%d space=%d level=%ld  %s\n",
                    (unsigned long)i,
                    s.origin.x, s.origin.y, s.size.width, s.size.height,
                    w.origin.x, w.origin.y, w.size.width, w.size.height,
-                   _windows[i].isVisible,
+                   _windows[i].isVisible, _windows[i].isOnActiveSpace,
+                   (long)_windows[i].level,
                    NSEqualRects(s, w) ? "MATCH" : "MISMATCH");
         }
         fflush(stdout);
+    }
+}
+
+// The build-time dump above reports geometry, but occlusionState is only
+// meaningful once the compositor has settled — at build it is stale. This runs a
+// couple of seconds after launch and answers the question isVisible can't: is
+// each window *actually* on screen and unoccluded? A secondary-display window
+// that reads visible=1 but occlusionVisible=0 is the real failure — AppKit
+// thinks it's up, the window server has it covered.
+- (void)dumpSettledCoverage {
+    if (!self.debug || _quitting) return;
+    printf("settled coverage (%lu windows):\n", (unsigned long)_windows.count);
+    for (NSUInteger i = 0; i < _windows.count; i++) {
+        OverlayWindow *w = _windows[i];
+        BOOL occVisible = (w.occlusionState & NSWindowOcclusionStateVisible) != 0;
+        printf("  [%lu] visible=%d onActiveSpace=%d occlusionVisible=%d level=%ld screen=%s\n",
+               (unsigned long)i, w.isVisible, w.isOnActiveSpace, occVisible,
+               (long)w.level, w.screen ? "set" : "nil");
+    }
+    fflush(stdout);
+}
+
+// Secondary-display coverage can be lost after launch even while AppKit still
+// reports the window visible: another elevated window can occlude it, or the
+// window server can demote a shield-level window on a non-active display. The
+// focus timer calls this every tick to re-assert each window at the shielding
+// level and re-front it. It deliberately skips the key window, so the focused
+// password field — and anything being typed into it — is never disturbed.
+- (void)assertCoverage {
+    if (_quitting) return;
+    NSWindowLevel shield = CGShieldingWindowLevel();
+    for (OverlayWindow *w in _windows) {
+        if (w.level != shield) w.level = shield;
+        if (!w.isKeyWindow) [w orderFrontRegardless];
     }
 }
 
